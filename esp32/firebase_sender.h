@@ -96,7 +96,11 @@ static bool loadSlot(uint8_t slot, Reading *items, uint16_t &count, uint32_t &fi
 }
 
 static void loadQueue() {
-  flashReady = LittleFS.begin(false); // Jangan hapus antrean jika mount gagal.
+  flashReady = LittleFS.begin(false); // Coba mount tanpa format agar antrean lama tidak hilang
+  if (!flashReady) {
+    Serial.println("LittleFS belum terformat atau korup. Memformat partisi...");
+    flashReady = LittleFS.begin(true); // Format jika mount gagal
+  }
   if (!flashReady) {
     Serial.println("LittleFS gagal; antrean hanya tersedia di RAM.");
     return;
@@ -217,10 +221,15 @@ void feedByte(char c) {
       Reading parsed;
       bool pressureAlarm = false;
       if (parseNano(line, parsed, pressureAlarm)) {
+        if (!haveNano) {
+          Serial.println("Berhasil menerima data valid pertama dari Arduino Nano!");
+        }
         latestNano = parsed;
         latestPressureAlarm = pressureAlarm;
         haveNano = true;
         lastNanoAt = millis();
+      } else {
+        Serial.printf("Format data Nano tidak valid: %s\n", line);
       }
     }
     lineLength = 0;
@@ -315,13 +324,22 @@ void setCloudReachable(bool reachable) {
 static bool ensureAuth();
 
 bool probeFirebase() {
-  if (!configReady || WiFi.status() != WL_CONNECTED || !epochMs() || !ensureAuth()) return false;
+  if (!configReady || WiFi.status() != WL_CONNECTED || !epochMs()) return false;
+  if (!ensureAuth()) {
+    Serial.println("Probe Firebase ditunda: token Auth belum siap.");
+    return false;
+  }
   String base(FIREBASE_DATABASE_URL);
   if (base.endsWith("/")) base.remove(base.length() - 1);
   String response;
   int code = request(base + "/gaskeun/v1/devices/" + DEVICE_ID + "/latest.json?auth=" +
-                     idToken, "GET", "", response, 2500);
-  if (code == 401) idToken = "";
+                     idToken, "GET", "", response, 6000);
+  if (code == 401) {
+    Serial.println("Probe Firebase gagal (HTTP 401 Unauthorized / Permission Denied).");
+    idToken = "";
+  } else if (code != 200) {
+    Serial.printf("Probe Firebase respon: HTTP %d\n", code);
+  }
   // 200 juga berlaku ketika latest belum ada (respons null).
   return code == 200;
 }
@@ -365,12 +383,14 @@ static bool signIn() {
   if (credentials.overflowed()) return false;
   String body, response;
   serializeJson(credentials, body);
+  Serial.println("Mencoba login ke Firebase Authentication...");
   int code = request(String("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=") +
                      FIREBASE_API_KEY, "POST", body, response);
   if (code != 200) {
-    Serial.printf("Login Firebase gagal (HTTP %d); periksa akun/API key/jaringan.\n", code);
+    Serial.printf("Login Firebase gagal (HTTP %d); response: %s\n", code, response.c_str());
     return false;
   }
+  Serial.println("Login Firebase Auth BERHASIL!");
   DynamicJsonDocument result(4096);
   if (deserializeJson(result, response) || !result["idToken"].is<const char *>()) return false;
   idToken = result["idToken"].as<String>();
@@ -422,11 +442,12 @@ static bool uploadOldest() {
   snprintf(key, sizeof(key), "%llu", static_cast<unsigned long long>(reading.timestampMs));
   String json = toJson(reading);
   if (json.isEmpty()) return false;
+  Serial.printf("Mengunggah data ke Firebase (/readings/%s)...\n", key);
   String response;
   int code = request(base + "/readings/" + key + ".json" + token, "PUT", json, response);
   if (code == 401) idToken = "";
   if (code < 200 || code >= 300) {
-    Serial.printf("Gagal tulis readings (HTTP %d); akan dicoba lagi.\n", code);
+    Serial.printf("Gagal tulis readings (HTTP %d); response: %s\n", code, response.c_str());
     return false;
   }
 
