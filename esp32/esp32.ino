@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "firebase_sender.h"
+#include "wifi_manager.h"
 #include "offline_portal.h"
 
 const int NANO_RX_PIN = 16;  // Menerima dari TX Nano
@@ -20,6 +21,7 @@ void setup() {
 
   Serial.println("Menunggu data Arduino Nano...");
   FirebaseSender::begin();
+  WifiManager::begin();
   OfflinePortal::begin();
 }
 
@@ -29,6 +31,7 @@ void loop() {
     Serial.write(c);
     FirebaseSender::feedByte(c);
   }
+  WifiManager::tick();
   OfflinePortal::tick();
   FirebaseSender::tick();
 }

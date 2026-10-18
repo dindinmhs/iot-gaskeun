@@ -10,8 +10,8 @@ const byte BUZZER_PIN = 3;
 
 const float AMBANG_TEKANAN_KPA = 5.0;
 // Ambang ADC sementara untuk uji buzzer; wajib dikalibrasi pada perangkat asli.
-const float AMBANG_MQ4_2_ADC = 400.0;
-const float AMBANG_MQ136_ADC = 350.0;
+const float AMBANG_MQ4_2_ADC = 600.0;
+const float AMBANG_MQ136_ADC = 600.0;
 const unsigned long WAKTU_AMAN_GAS_MS = 10000;
 
 OneWire oneWire(DS_PIN);

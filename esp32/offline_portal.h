@@ -1,13 +1,16 @@
 #pragma once
 
 #include <Arduino.h>
+#include <DNSServer.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include "firebase_sender.h"
+#include "wifi_manager.h"
 
 namespace OfflinePortal {
 
 static WebServer server(80);
+static DNSServer dnsServer;
 static bool apActive = false;
 static bool apSettingsValid = false;
 static bool wasStationConnected = false;
@@ -16,6 +19,7 @@ static uint32_t startedAt = 0;
 static uint32_t lastProbeAt = 0;
 static uint32_t lastAPAttemptAt = 0;
 static bool triedAP = false;
+static uint32_t lastWifiSetupAt = 0;
 
 static const char PAGE[] PROGMEM = R"HTML(
 <!doctype html>
@@ -40,6 +44,12 @@ static const char PAGE[] PROGMEM = R"HTML(
     .value{font-size:1.5rem;font-weight:700;overflow-wrap:anywhere}
     .small{font-size:1rem}
     footer{margin-top:20px;font-size:.85rem;color:#526d66}
+    section{margin-top:22px}
+    label{display:block;margin:12px 0 6px}
+    input,button{font:inherit;padding:10px;border:1px solid #a7bdb5;border-radius:8px}
+    input{width:100%}
+    button{margin-top:14px;background:#173e32;color:white;cursor:pointer}
+    button:disabled{opacity:.6;cursor:wait}
   </style>
 </head>
 <body>
@@ -57,6 +67,21 @@ static const char PAGE[] PROGMEM = R"HTML(
     <div class="card"><div class="label">Kualitas data</div><div class="value small" id="quality">—</div></div>
     <div class="card"><div class="label">Antrean ke Firebase</div><div class="value" id="queue">—</div></div>
   </div>
+  <section class="card" aria-labelledby="wifi-heading">
+    <h2 id="wifi-heading">Pengaturan WiFi</h2>
+    <p class="muted">Masukkan jaringan WiFi 2,4 GHz baru. Jaringan disimpan setelah berhasil tersambung dan tetap digunakan setelah ESP32 dinyalakan ulang.</p>
+    <p id="wifi-status" role="status" aria-live="polite">Memuat status WiFi...</p>
+    <p id="wifi-feedback" role="alert"></p>
+    <form id="wifi-form">
+      <label for="wifi-ssid">Nama WiFi (SSID)</label>
+      <input id="wifi-ssid" name="ssid" required autocomplete="off">
+      <label for="wifi-password">Password WiFi</label>
+      <input id="wifi-password" name="password" type="password" maxlength="64" autocomplete="new-password" aria-describedby="wifi-password-help">
+      <p class="muted" id="wifi-password-help">Kosongkan untuk jaringan tanpa password.</p>
+      <button id="wifi-submit" type="submit">Hubungkan dan simpan</button>
+    </form>
+    <p class="muted">Jika gagal, hotspot tetap aktif agar Anda bisa mencoba lagi. Setelah koneksi internet pulih, hotspot akan mati otomatis.</p>
+  </section>
   <footer>
     <div id="status">—</div>
     <p>Nilai MQ adalah ADC mentah (0–1023), bukan konsentrasi gas dalam ppm.
@@ -65,6 +90,41 @@ static const char PAGE[] PROGMEM = R"HTML(
 </main>
 <script>
 const el = id => document.getElementById(id);
+let wifiSubmitting = false;
+async function refreshWifi() {
+  try {
+    const response = await fetch('/api/wifi', {cache:'no-store'});
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const data = await response.json();
+    el('wifi-status').textContent = (data.connected ? 'Tersambung ke ' : 'Jaringan terakhir: ') +
+      (data.ssid || 'belum diatur') +
+      (data.connected && data.ip ? ' | IP ESP32: ' + data.ip : '') + '. ' + data.message;
+    if (!wifiSubmitting) el('wifi-submit').disabled = data.busy;
+  } catch (error) {
+    el('wifi-status').textContent = 'Status belum tersedia. Sambungkan kembali ke hotspot ESP32 jika masih aktif.';
+  }
+}
+el('wifi-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  wifiSubmitting = true;
+  el('wifi-submit').disabled = true;
+  try {
+    const response = await fetch('/api/wifi', {
+      method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded', 'X-Gaskeun-WiFi':'1'},
+      body:new URLSearchParams({ssid:el('wifi-ssid').value, password:el('wifi-password').value})
+    });
+    const data = await response.json();
+    el('wifi-feedback').textContent = data.message;
+    if (response.ok) el('wifi-password').value = '';
+  } catch (error) {
+    el('wifi-feedback').textContent = 'Permintaan belum terkonfirmasi. Sambungkan kembali ke hotspot dan periksa status.';
+  } finally {
+    wifiSubmitting = false;
+    el('wifi-submit').disabled = false;
+    await refreshWifi();
+  }
+});
 const number = (value, digits, unit) =>
   typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) + unit : '—';
 async function refresh() {
@@ -98,7 +158,9 @@ async function refresh() {
   }
 }
 refresh();
+refreshWifi();
 setInterval(refresh, 2000);
+setInterval(refreshWifi, 2000);
 </script>
 </body>
 </html>
@@ -114,6 +176,8 @@ static void sendForbidden() {
 
 void begin() {
   startedAt = millis();
+  const char *headers[] = {"X-Gaskeun-WiFi"};
+  server.collectHeaders(headers, 1);
   apSettingsValid = strlen(OFFLINE_AP_SSID) > 0 && strlen(OFFLINE_AP_SSID) <= 32 &&
                     strlen(OFFLINE_AP_PASSWORD) >= 8 && strlen(OFFLINE_AP_PASSWORD) <= 63 &&
                     strcmp(OFFLINE_AP_PASSWORD, "GANTI_PASSWORD_HOTSPOT") != 0;
@@ -130,8 +194,33 @@ void begin() {
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "application/json", FirebaseSender::statusJson());
   });
+  server.on("/api/wifi", HTTP_GET, []() {
+    if (!fromHotspot()) { sendForbidden(); return; }
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", WifiManager::statusJson());
+  });
+  server.on("/api/wifi", HTTP_POST, []() {
+    if (!fromHotspot()) { sendForbidden(); return; }
+    server.sendHeader("Cache-Control", "no-store");
+    if (server.header("X-Gaskeun-WiFi") != "1") { sendForbidden(); return; }
+    if (WifiManager::busy()) {
+      server.send(409, "application/json", "{\"message\":\"Sedang mencoba jaringan. Tunggu hingga selesai.\"}");
+      return;
+    }
+    if (!server.hasArg("ssid") || !server.hasArg("password") ||
+        !WifiManager::requestConnect(server.arg("ssid"), server.arg("password"))) {
+      server.send(400, "application/json", "{\"message\":\"SSID harus 1-32 byte. Password harus kosong, 8-63 byte, atau PSK heksadesimal 64 digit.\"}");
+      return;
+    }
+    server.send(202, "application/json", "{\"message\":\"Mencoba WiFi baru. Tunggu hingga 20 detik.\"}");
+  });
   server.onNotFound([]() {
     if (!fromHotspot()) { sendForbidden(); return; }
+    if (server.method() == HTTP_GET) {
+      server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/");
+      server.send(302, "text/plain", "Buka pengaturan WiFi ESP32.");
+      return;
+    }
     server.send(404, "text/plain", "Halaman tidak ditemukan.");
   });
 }
@@ -148,6 +237,7 @@ static void startAP() {
   }
   server.begin();
   apActive = true;
+  dnsServer.start(53, "*", WiFi.softAPIP());
   Serial.print("Hotspot offline aktif. Buka http://");
   Serial.print(WiFi.softAPIP());
   Serial.println("/");
@@ -155,6 +245,8 @@ static void startAP() {
 
 static void stopAP() {
   if (!apActive) return;
+  if (WifiManager::busy() || uint32_t(millis() - lastWifiSetupAt) < 15000) return;
+  dnsServer.stop();
   server.stop();
   WiFi.softAPdisconnect(false);
   WiFi.mode(WIFI_STA);
@@ -164,13 +256,24 @@ static void stopAP() {
 }
 
 void tick() {
-  if (apActive) server.handleClient();
+  if (apActive) {
+    dnsServer.processNextRequest();
+    server.handleClient();
+  }
+  if (WifiManager::busy()) {
+    lastWifiSetupAt = millis();
+    FirebaseSender::setCloudReachable(false);
+    onlineChecks = 0;
+    wasStationConnected = false;
+    return;
+  }
   bool connected = WiFi.status() == WL_CONNECTED;
   if (!connected || !FirebaseSender::configured()) {
     FirebaseSender::setCloudReachable(false);
     onlineChecks = 0;
     wasStationConnected = false;
-    if (uint32_t(millis() - startedAt) >= 10000) startAP();
+    if (WifiManager::needsPortal() ||
+        (!FirebaseSender::configured() && uint32_t(millis() - startedAt) >= 10000)) startAP();
     return;
   }
 

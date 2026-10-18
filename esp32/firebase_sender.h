@@ -13,7 +13,7 @@
 
 namespace FirebaseSender {
 
-constexpr uint32_t INTERVAL_MS = 300000; // 5 menit, sesuai config.json server.
+constexpr uint32_t INTERVAL_MS = 60000; // 5 menit, sesuai config.json server.
 constexpr uint32_t MAX_NANO_AGE_MS = 15000;
 constexpr uint16_t CAPACITY = 288;       // Maksimum 24 jam; batas flash/RAM.
 constexpr uint32_t FILE_MAGIC = 0x47535131;
@@ -55,7 +55,6 @@ static bool haveNano = false;
 static uint32_t lastNanoAt = 0;
 static uint32_t lastSampleAt = 0;
 static uint32_t lastNoNanoLogAt = 0;
-static uint32_t lastWifiAttemptAt = 0;
 static uint32_t lastUploadAttemptAt = 0;
 static bool lastUploadSucceeded = false;
 static uint8_t uploadFailures = 0;
@@ -173,8 +172,6 @@ static bool validConfig() {
       !(host.endsWith(".firebasedatabase.app") || host.endsWith(".firebaseio.com")) ||
       host.indexOf('/') >= 0 || host.indexOf("PROJECT") >= 0 ||
       strlen(FIREBASE_API_KEY) < 10 || strcmp(FIREBASE_API_KEY, "WEB_API_KEY") == 0 ||
-      strcmp(WIFI_SSID, "NAMA_WIFI") == 0 ||
-      strcmp(WIFI_PASSWORD, "PASSWORD_WIFI") == 0 ||
       strchr(DEVICE_EMAIL, '@') == nullptr ||
       strstr(DEVICE_EMAIL, "example.com") != nullptr ||
       strlen(DEVICE_PASSWORD) < 8 ||
@@ -288,23 +285,58 @@ static void maintainWifi() {
     Serial.println("Wi-Fi terputus; data tetap diantrikan.");
   }
   wasConnected = connected;
-  if (!connected && uint32_t(millis() - lastWifiAttemptAt) >= 15000) {
-    lastWifiAttemptAt = millis();
-    WiFi.reconnect();
-  }
 }
 
 static int request(const String &url, const char *method, const String &body,
                    String &response, uint16_t timeoutMs = 6000) {
+  response = "";
+  // Cetak hostname saja: URL lengkap berisi API key atau token Auth.
+  int hostEnd = url.indexOf('/', 8);
+  String host = url.substring(8, hostEnd < 0 ? url.length() : hostEnd);
+  auto logNetwork = []() {
+    Serial.printf("[HTTPS] WiFi=%d, RSSI=%d dBm\n", int(WiFi.status()), int(WiFi.RSSI()));
+    Serial.print("[HTTPS] IP="); Serial.print(WiFi.localIP());
+    Serial.print(", gateway="); Serial.print(WiFi.gatewayIP());
+    Serial.print(", DNS="); Serial.println(WiFi.dnsIP());
+    Serial.printf("[HTTPS] epoch=%llu, heap=%u, blok terbesar=%u byte\n",
+                  static_cast<unsigned long long>(epochMs() / 1000),
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  };
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[HTTPS] Dibatalkan: WiFi belum tersambung.");
+    return HTTPC_ERROR_NOT_CONNECTED;
+  }
+  IPAddress remoteIP;
+  if (!WiFi.hostByName(host.c_str(), remoteIP)) {
+    Serial.printf("[HTTPS] DNS gagal untuk %s. Periksa DNS dan akses internet router.\n", host.c_str());
+    logNetwork();
+    return HTTPC_ERROR_CONNECTION_REFUSED;
+  }
   WiFiClientSecure tls;
   tls.setCACert(FIREBASE_ROOT_CA);
   HTTPClient http;
-  if (!http.begin(tls, url)) return -1;
+  if (!http.begin(tls, url)) {
+    Serial.printf("[HTTPS] Gagal menyiapkan request ke host %s.\n", host.c_str());
+    return HTTPC_ERROR_NO_HTTP_SERVER;
+  }
   http.setConnectTimeout(timeoutMs);
   http.setTimeout(timeoutMs);
   if (body.length()) http.addHeader("Content-Type", "application/json");
+  uint32_t requestStartedAt = millis();
   int code = http.sendRequest(method, body);
   if (code > 0) response = http.getString();
+  else {
+    // Ambil error TLS sebelum http.end() menutup client.
+    char tlsMessage[192] = {};
+    int tlsCode = tls.lastError(tlsMessage, sizeof(tlsMessage));
+    Serial.printf("[HTTPS] host=%s, HTTPClient=%d (%s), durasi=%lu ms\n",
+                  host.c_str(), code, HTTPClient::errorToString(code).c_str(),
+                  static_cast<unsigned long>(millis() - requestStartedAt));
+    Serial.print("[HTTPS] IP server="); Serial.println(remoteIP);
+    Serial.printf("[HTTPS] TLS=%d: %s\n", tlsCode, tlsMessage);
+    logNetwork();
+    Serial.println("[HTTPS] Jika TLS=0, periksa akses internet/port 443; jika error sertifikat, periksa jam UTC dan CA.");
+  }
   http.end();
   return code;
 }
@@ -387,7 +419,11 @@ static bool signIn() {
   int code = request(String("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=") +
                      FIREBASE_API_KEY, "POST", body, response);
   if (code != 200) {
-    Serial.printf("Login Firebase gagal (HTTP %d); response: %s\n", code, response.c_str());
+    if (code < 0) {
+      Serial.printf("Login Firebase gagal pada koneksi HTTPS (%d); lihat log [HTTPS] di atas.\n", code);
+    } else {
+      Serial.printf("Login Firebase gagal (HTTP %d); response: %s\n", code, response.c_str());
+    }
     return false;
   }
   Serial.println("Login Firebase Auth BERHASIL!");
@@ -482,13 +518,9 @@ void begin() {
   lastSampleAt = millis() - INTERVAL_MS;
   configReady = validConfig();
   if (!configReady) {
-    Serial.println("Konfigurasi belum lengkap. Isi esp32_secrets.h lalu upload ulang.");
+    Serial.println("Konfigurasi Firebase belum lengkap. Isi esp32_secrets.h lalu upload ulang.");
     return;
   }
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  lastWifiAttemptAt = millis();
 }
 
 void tick() {
